@@ -2,6 +2,10 @@
 .env
 .venv/
 
+# Generated exports
+rank_drops_*.csv
+rank_anomalies_*.csv
+
 # Python
 __pycache__/
 *.py[cod]
