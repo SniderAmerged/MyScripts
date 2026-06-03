@@ -5,6 +5,7 @@
 # Generated exports
 rank_drops_*.csv
 rank_anomalies_*.csv
+rank_uniformity_*.csv
 
 # Python
 __pycache__/

@@ -47,6 +47,18 @@ MIN_BASELINE_CHANGES = 10
 # Minimum series in a cohort before its median move is used for de-noising.
 DEFAULT_MIN_COHORT_SIZE = 3
 
+# --- Uniformity-mode defaults ----------------------------------------------
+# Min child ASINs a parent needs for an intra-parent variance test to be valid.
+DEFAULT_MIN_CHILDREN = 3
+# A group is "uniform" when max_rank <= this ratio * min_rank (tight cluster).
+DEFAULT_UNIFORM_RATIO = 1.5
+# A day is "dispersed" when max_rank >= this ratio * min_rank (fanned out).
+DEFAULT_DIVERGENCE_RATIO = 3.0
+# A child has "diverged" when its rank >= this factor * the prior uniform level.
+DEFAULT_CHILD_DEVIATION_FACTOR = 2.0
+# Fraction of children that must diverge to call the event anomalous (else suspect).
+DEFAULT_ANOMALOUS_FRACTION = 2 / 3
+
 
 @dataclass(frozen=True)
 class Observation:
@@ -240,6 +252,173 @@ def detect_anomalous_drop(
     return best
 
 
+# Minimum baseline days with enough children needed to call a parent "normally
+# uniform" before testing for a divergence event.
+MIN_UNIFORM_BASELINE_DAYS = 3
+
+
+@dataclass(frozen=True)
+class ChildRank:
+    """One child ASIN's standing on a parent's divergence-event day."""
+
+    asin: str
+    rank: int
+    deviation_x: float  # rank / prior uniform level (>=1 worse, <1 better)
+    diverged: bool
+
+
+@dataclass(frozen=True)
+class UniformityEvent:
+    """A parent whose children's main ranks suddenly lost uniformity."""
+
+    parent_asin: str
+    rank_type: int  # 1 = subcategory, 2 = main
+    category: str
+    severity: str  # "anomalous" | "suspect"
+    event_date: date
+    prior_uniform_rank: float
+    spread_ratio: float  # max_rank / min_rank on the event day
+    children: list[ChildRank]
+    other_event_dates: list[date]
+
+    @property
+    def n_children(self) -> int:
+        return len(self.children)
+
+    @property
+    def n_diverged(self) -> int:
+        return sum(c.diverged for c in self.children)
+
+    @property
+    def diverged_fraction(self) -> float:
+        return self.n_diverged / self.n_children if self.children else 0.0
+
+    @property
+    def last_event_date(self) -> date:
+        """Most recent date the divergence occurred (strongest or any other)."""
+        return max([self.event_date, *self.other_event_dates])
+
+
+def _spread_ratio(ranks: list[int]) -> float:
+    """max/min of a group's ranks (1.0 == perfectly uniform)."""
+    lo = min(ranks)
+    return max(ranks) / lo if lo > 0 else float("inf")
+
+
+def detect_uniformity_break(
+    parent_asin: str,
+    category: str,
+    per_date_child_ranks: dict[date, dict[str, int]],
+    window_start: date,
+    *,
+    rank_type: int = 2,
+    min_children: int,
+    uniform_ratio: float,
+    divergence_ratio: float,
+    child_deviation_factor: float,
+    anomalous_fraction: float,
+    relative_divergence: float | None = None,
+) -> UniformityEvent | None:
+    """Flag a parent whose children's main ranks suddenly fan out.
+
+    Pure function (no DB). ``per_date_child_ranks`` maps a date to ``{child_asin:
+    rank}`` for one (parent, category) group. The parent must be *normally
+    uniform* before the window; a window day qualifies when the immediately
+    prior day was uniform (``max/min <= uniform_ratio``) and that day is
+    dispersed past the divergence bar. The bar is absolute (``>= divergence_ratio``)
+    by default, or — when ``relative_divergence`` is given — relative to the
+    family's own normal spread (``>= relative_divergence * baseline_median_spread``),
+    so a normally ultra-tight family trips on a smaller absolute fan-out. Among
+    the children, those whose rank is ``>= child_deviation_factor`` times the prior
+    uniform level count as "diverged"; ``>= anomalous_fraction`` of them diverging
+    makes the event *anomalous*, otherwise *suspect* (needs at least one). The
+    strongest day (largest spread) is returned; the rest go into
+    ``other_event_dates``.
+    """
+    dated = sorted(
+        (d, ranks)
+        for d, ranks in per_date_child_ranks.items()
+        if len(ranks) >= min_children
+    )
+    if len(dated) < 2:
+        return None
+
+    # The parent must be normally uniform before the window.
+    baseline_spreads = [
+        _spread_ratio(list(ranks.values())) for d, ranks in dated if d < window_start
+    ]
+    if len(baseline_spreads) < MIN_UNIFORM_BASELINE_DAYS:
+        return None
+    baseline_median_spread = median(baseline_spreads)
+    if baseline_median_spread > uniform_ratio:
+        return None
+
+    # The fan-out bar: absolute, or relative to this family's normal spread.
+    divergence_bar = (
+        relative_divergence * baseline_median_spread
+        if relative_divergence is not None
+        else divergence_ratio
+    )
+
+    candidates: list[UniformityEvent] = []
+    for idx in range(1, len(dated)):
+        day, ranks = dated[idx]
+        if day < window_start:
+            continue
+        _, prev_ranks = dated[idx - 1]
+        prev_spread = _spread_ratio(list(prev_ranks.values()))
+        spread = _spread_ratio(list(ranks.values()))
+        # Onset: uniform the prior day, dispersed today.
+        if prev_spread > uniform_ratio or spread < divergence_bar:
+            continue
+        level = float(median(list(prev_ranks.values())))
+        children = [
+            ChildRank(
+                asin=asin,
+                rank=rank,
+                deviation_x=rank / level if level > 0 else float("inf"),
+                diverged=rank >= child_deviation_factor * level,
+            )
+            for asin, rank in sorted(ranks.items())
+        ]
+        n_diverged = sum(c.diverged for c in children)
+        if n_diverged == 0:  # spread came only from improvement — not a drop
+            continue
+        fraction = n_diverged / len(children)
+        severity = "anomalous" if fraction >= anomalous_fraction else "suspect"
+        candidates.append(
+            UniformityEvent(
+                parent_asin=parent_asin,
+                rank_type=rank_type,
+                category=category,
+                severity=severity,
+                event_date=day,
+                prior_uniform_rank=level,
+                spread_ratio=spread,
+                children=children,
+                other_event_dates=[],
+            )
+        )
+
+    if not candidates:
+        return None
+    strongest = max(candidates, key=lambda e: e.spread_ratio)
+    others = sorted(
+        e.event_date for e in candidates if e.event_date != strongest.event_date
+    )
+    return UniformityEvent(
+        parent_asin=strongest.parent_asin,
+        rank_type=strongest.rank_type,
+        category=strongest.category,
+        severity=strongest.severity,
+        event_date=strongest.event_date,
+        prior_uniform_rank=strongest.prior_uniform_rank,
+        spread_ratio=strongest.spread_ratio,
+        children=strongest.children,
+        other_event_dates=others,
+    )
+
+
 def fetch_account_asins(
     conn: psycopg.Connection, amerge_id: str, marketplace: str | None
 ) -> list[str]:
@@ -255,6 +434,31 @@ def fetch_account_asins(
     with conn.cursor() as cur:
         cur.execute(sql, params)
         return [row[0] for row in cur.fetchall()]
+
+
+def fetch_parent_map(
+    conn: psycopg.Connection, amerge_id: str, marketplace: str | None
+) -> dict[str, str]:
+    """Map each child ASIN (product_code) -> its parent_asin for an account.
+
+    Only products that have a non-empty parent are returned. If a product_code
+    appears under more than one parent, the first seen wins (rare; logged-free).
+    """
+    sql = (
+        "SELECT DISTINCT product_code, parent_asin "
+        "FROM public.registry_api_asinregistry "
+        "WHERE amerge_id = %(amerge_id)s AND product_code <> '' AND parent_asin <> ''"
+    )
+    params: dict[str, object] = {"amerge_id": amerge_id}
+    if marketplace:
+        sql += " AND marketplace = %(marketplace)s"
+        params["marketplace"] = marketplace
+    parent_of: dict[str, str] = {}
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        for product_code, parent_asin in cur.fetchall():
+            parent_of.setdefault(product_code, parent_asin)
+    return parent_of
 
 
 def fetch_latest_report_date(conn: psycopg.Connection) -> date | None:
@@ -467,6 +671,89 @@ def find_rank_anomalies(
     return findings, summary
 
 
+# Sort key for severity: anomalous before suspect.
+_SEVERITY_ORDER = {"anomalous": 0, "suspect": 1}
+
+
+def find_uniformity_breaks(
+    registry_conn: psycopg.Connection,
+    roas_conn: psycopg.Connection,
+    *,
+    amerge_id: str,
+    days: int,
+    baseline_days: int,
+    min_children: int,
+    uniform_ratio: float,
+    divergence_ratio: float,
+    child_deviation_factor: float,
+    anomalous_fraction: float,
+    marketplace: str | None,
+    rank_type: str = "2",
+    relative_divergence: float | None = None,
+) -> tuple[list[UniformityEvent], dict[str, object]]:
+    """Uniformity-mode pipeline: flag parents whose children's ranks fan out.
+
+    ``rank_type`` selects which category ranks to compare within each parent:
+    "2" main only, "1" subcategory only, or "both". Each (parent, type,
+    category) is its own independent sibling group.
+    """
+    parent_of = fetch_parent_map(registry_conn, amerge_id, marketplace)
+    summary: dict[str, object] = {
+        "amerge_id": amerge_id,
+        "child_asin_count": len(parent_of),
+        "parents_scanned": 0,
+    }
+    if not parent_of:
+        return [], summary
+
+    cur_date = fetch_latest_report_date(roas_conn)
+    if cur_date is None:
+        return [], summary
+    window_start = cur_date - timedelta(days=days)
+    fetch_start = window_start - timedelta(days=baseline_days)
+    summary["window_start"] = window_start
+    summary["window_end"] = cur_date
+    summary["baseline_start"] = fetch_start
+
+    series, categories = fetch_series(
+        roas_conn, list(parent_of), fetch_start, cur_date, rank_type=rank_type
+    )
+
+    # Group into (parent, rank_type, category) -> {date -> {child_asin -> rank}}.
+    # Type is in the key so a main-category title can't merge with a subcategory.
+    groups: dict[tuple[str, int, str], dict[date, dict[str, int]]] = {}
+    for key, observations in series.items():
+        asin, rtype, _cat_hash = key
+        parent = parent_of.get(asin)
+        if parent is None:
+            continue
+        group_key = (parent, rtype, categories[key])
+        by_date = groups.setdefault(group_key, {})
+        for obs in observations:
+            by_date.setdefault(obs.report_date, {})[asin] = obs.rank
+    summary["parents_scanned"] = len({p for p, _, _ in groups})
+
+    events: list[UniformityEvent] = []
+    for (parent, rtype, category), per_date in groups.items():
+        event = detect_uniformity_break(
+            parent,
+            category,
+            per_date,
+            window_start,
+            rank_type=rtype,
+            min_children=min_children,
+            uniform_ratio=uniform_ratio,
+            divergence_ratio=divergence_ratio,
+            child_deviation_factor=child_deviation_factor,
+            anomalous_fraction=anomalous_fraction,
+            relative_divergence=relative_divergence,
+        )
+        if event is not None:
+            events.append(event)
+    events.sort(key=lambda e: (_SEVERITY_ORDER.get(e.severity, 9), -e.spread_ratio))
+    return events, summary
+
+
 def _type_label(rank_type: int) -> str:
     return RANK_TYPE_LABELS.get(rank_type, str(rank_type))
 
@@ -586,13 +873,86 @@ def write_anomaly_csv(findings: list[AnomalyFinding], path: str) -> None:
             )
 
 
+def render_uniformity_table(events: list[UniformityEvent]) -> str:
+    """Aligned text table: one line per flagged parent (strongest event)."""
+    header = (
+        f"{'PARENT':<12} {'TYPE':<12} {'SEVERITY':<10} {'CATEGORY':<22} "
+        f"{'EVENT DATE':<11} {'CHILD':>5} {'DIV':>4} {'FRAC':>5} "
+        f"{'PRIOR':>8} {'SPREAD×':>8}  {'OTHER DATES':<24}"
+    )
+    lines = [header, "-" * len(header)]
+    for e in events:
+        others = ",".join(d.isoformat() for d in e.other_event_dates) or "-"
+        lines.append(
+            f"{e.parent_asin:<12} {_type_label(e.rank_type):<12} {e.severity:<10} "
+            f"{_truncate(e.category, 22):<22} "
+            f"{e.event_date.isoformat():<11} {e.n_children:>5} {e.n_diverged:>4} "
+            f"{e.diverged_fraction:>5.0%} {round(e.prior_uniform_rank):>8} "
+            f"{e.spread_ratio:>7.1f}x  {_truncate(others, 24):<24}"
+        )
+    return "\n".join(lines)
+
+
+UNIFORMITY_CSV_HEADER = [
+    "parent_asin",
+    "rank_type",
+    "rank_type_label",
+    "asin",
+    "category",
+    "event_date",
+    "last_event_date",
+    "severity",
+    "n_children",
+    "n_diverged",
+    "diverged_fraction",
+    "prior_uniform_rank",
+    "child_rank",
+    "child_deviation_x",
+    "child_diverged",
+    "other_event_dates",
+]
+
+
+def write_uniformity_csv(events: list[UniformityEvent], path: str) -> None:
+    """Write uniformity findings to ``path`` — one row per child of each parent."""
+    with open(path, "w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(UNIFORMITY_CSV_HEADER)
+        for e in events:
+            others = ",".join(d.isoformat() for d in e.other_event_dates)
+            for c in e.children:
+                writer.writerow(
+                    [
+                        e.parent_asin,
+                        e.rank_type,
+                        _type_label(e.rank_type),
+                        c.asin,
+                        e.category,
+                        e.event_date.isoformat(),
+                        e.last_event_date.isoformat(),
+                        e.severity,
+                        e.n_children,
+                        e.n_diverged,
+                        f"{e.diverged_fraction:.3f}",
+                        round(e.prior_uniform_rank),
+                        c.rank,
+                        f"{c.deviation_x:.2f}",
+                        int(c.diverged),
+                        others,
+                    ]
+                )
+
+
 def default_output_path(
     amerge_id: str, end_date: date | None, mode: str, days: int
 ) -> str:
     """Build a default CSV filename from mode, account id, time span and end."""
     safe_id = amerge_id.replace(":", "_").replace("/", "_")
     suffix = end_date.isoformat() if end_date else "latest"
-    stem = "rank_anomalies" if mode == "anomaly" else "rank_drops"
+    stem = {
+        "anomaly": "rank_anomalies",
+        "uniformity": "rank_uniformity",
+    }.get(mode, "rank_drops")
     return f"{stem}_{safe_id}_T-{days}_{suffix}.csv"
 
 
@@ -603,10 +963,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--amerge-id", required=True, help="Account amerge_id")
     parser.add_argument(
         "--mode",
-        choices=("threshold", "anomaly"),
+        choices=("threshold", "anomaly", "uniformity"),
         default="threshold",
-        help="Detection mode: 'threshold' (fixed %%/positions, default) or "
-        "'anomaly' (drops unusual vs each product's own history).",
+        help="Detection mode: 'threshold' (fixed %%/positions, default), "
+        "'anomaly' (drops unusual vs each product's own history), or "
+        "'uniformity' (a parent's child ASINs suddenly fan out in main rank).",
     )
     parser.add_argument(
         "--time-frame",
@@ -667,10 +1028,55 @@ def build_parser() -> argparse.ArgumentParser:
         f"(default {DEFAULT_MIN_COHORT_SIZE}).",
     )
     parser.add_argument(
+        "--min-children",
+        type=int,
+        default=DEFAULT_MIN_CHILDREN,
+        help=f"[uniformity] Min child ASINs a parent needs to test "
+        f"(default {DEFAULT_MIN_CHILDREN}).",
+    )
+    parser.add_argument(
+        "--uniform-ratio",
+        type=float,
+        default=DEFAULT_UNIFORM_RATIO,
+        help=f"[uniformity] max/min rank ratio still considered uniform "
+        f"(default {DEFAULT_UNIFORM_RATIO}).",
+    )
+    parser.add_argument(
+        "--divergence-ratio",
+        type=float,
+        default=DEFAULT_DIVERGENCE_RATIO,
+        help=f"[uniformity] max/min ratio that counts as a fan-out "
+        f"(default {DEFAULT_DIVERGENCE_RATIO}).",
+    )
+    parser.add_argument(
+        "--child-deviation-factor",
+        type=float,
+        default=DEFAULT_CHILD_DEVIATION_FACTOR,
+        help=f"[uniformity] a child diverged if rank >= factor x prior level "
+        f"(default {DEFAULT_CHILD_DEVIATION_FACTOR}).",
+    )
+    parser.add_argument(
+        "--anomalous-fraction",
+        type=float,
+        default=DEFAULT_ANOMALOUS_FRACTION,
+        help="[uniformity] fraction of children diverging to call anomalous "
+        "(default 2/3; pass 0.5 for >half, ~0.9 for all-but-few).",
+    )
+    parser.add_argument(
+        "--relative-divergence",
+        type=float,
+        default=None,
+        help="[uniformity] If set, the fan-out bar is K x the family's own normal "
+        "spread instead of the absolute --divergence-ratio (e.g. 1.5 flags a "
+        "family that spreads to 1.5x its usual tightness). Self-adjusts per family.",
+    )
+    parser.add_argument(
         "--rank-type",
         choices=("both", "1", "2"),
         default="both",
-        help="Rank type: 1=subcategory, 2=main, both (default).",
+        help="Rank type: 1=subcategory, 2=main, both (default). "
+        "In uniformity mode, 2=main only, 1=subcategories only, both=each "
+        "(parent, category) checked separately.",
     )
     parser.add_argument(
         "--marketplace",
@@ -707,6 +1113,8 @@ def main(argv: list[str] | None = None) -> int:
         psycopg.connect(registry_dsn) as registry_conn,
         psycopg.connect(roas_dsn) as roas_conn,
     ):
+        if args.mode == "uniformity":
+            return _run_uniformity(registry_conn, roas_conn, args)
         if args.mode == "anomaly":
             findings, summary = find_rank_anomalies(
                 registry_conn,
@@ -758,6 +1166,53 @@ def main(argv: list[str] | None = None) -> int:
         f"{summary['asin_count']} registered ({summary['series_scanned']} series "
         f"scanned) | mode {mode_label} | window {summary.get('window_start')} -> "
         f"{summary.get('window_end')} | CSV: {output_path}",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def _run_uniformity(
+    registry_conn: psycopg.Connection,
+    roas_conn: psycopg.Connection,
+    args: argparse.Namespace,
+) -> int:
+    """Run uniformity mode end to end (own output + summary shape)."""
+    events, summary = find_uniformity_breaks(
+        registry_conn,
+        roas_conn,
+        amerge_id=args.amerge_id,
+        days=args.time_frame,
+        baseline_days=args.baseline_days,
+        min_children=args.min_children,
+        uniform_ratio=args.uniform_ratio,
+        divergence_ratio=args.divergence_ratio,
+        child_deviation_factor=args.child_deviation_factor,
+        anomalous_fraction=args.anomalous_fraction,
+        marketplace=args.marketplace,
+        rank_type=args.rank_type,
+        relative_divergence=args.relative_divergence,
+    )
+
+    output_path = args.output or default_output_path(
+        args.amerge_id, summary.get("window_end"), args.mode, args.time_frame
+    )
+    write_uniformity_csv(events, output_path)
+
+    if not args.no_table:
+        print(
+            render_uniformity_table(events)
+            if events
+            else "No parents met the uniformity-break conditions."
+        )
+
+    n_anom = sum(e.severity == "anomalous" for e in events)
+    n_susp = sum(e.severity == "suspect" for e in events)
+    print(
+        f"\n# {len(events)} parent(s) flagged ({n_anom} anomalous, {n_susp} suspect) "
+        f"out of {summary['parents_scanned']} scanned "
+        f"({summary['child_asin_count']} child ASINs) | mode uniformity | "
+        f"window {summary.get('window_start')} -> {summary.get('window_end')} | "
+        f"CSV: {output_path}",
         file=sys.stderr,
     )
     return 0

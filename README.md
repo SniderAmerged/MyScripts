@@ -25,7 +25,7 @@ series is compared independently. `type 1` = subcategory rank, `type 2` =
 main/overall category rank. The category is parsed from `asin_ranks.id`
 (3rd `:`-segment) so the same category is paired across dates.
 
-It runs in one of two `--mode`s:
+It runs in one of three `--mode`s:
 
 - **`threshold`** (default) — flags a day-over-day worsening of `--min-pct` percent
   **or** `--min-positions` positions within the window. Simple and explicit, but
@@ -36,10 +36,15 @@ It runs in one of two `--mode`s:
   median + MAD), and flags a move only when it exceeds `--z-threshold` robust
   deviations **and** stays worse for `--min-sustain` observations (anti-blip).
   Best for surfacing likely Amazon detail-page issues out of normal churn.
+- **`uniformity`** — looks *across a parent's child ASINs* (variations) in the
+  **main category** only. Children normally share a near-identical rank; this
+  mode flags a parent when that uniformity suddenly breaks (the ranks fan out).
+  If a clear majority of children diverge it is **anomalous**; if only a few do
+  while most stay uniform it is **suspect**. Output is one CSV row per child.
 
-In both modes results are sorted (by size / by z-score), the largest qualifying
-move per ASIN/category is reported with the date + datetime it happened, and all
-findings are exported to a CSV file.
+The first two modes report the largest qualifying move per ASIN/category with the
+date it happened; `uniformity` reports each flagged parent (strongest event) with
+a per-child breakdown. All modes export to a CSV file.
 
 ### Usage
 
@@ -51,6 +56,10 @@ uv run python scripts/rank_drop_checker.py \
 # Anomaly detection (recommended for spotting PDP issues)
 uv run python scripts/rank_drop_checker.py \
     --amerge-id "US:US:1771995219729009" --time-frame T-7 --mode anomaly
+
+# Uniformity: a parent's variations suddenly fan out in main rank
+uv run python scripts/rank_drop_checker.py \
+    --amerge-id "US:US:1771995219729009" --time-frame T-14 --mode uniformity
 ```
 
 Common options:
@@ -58,17 +67,22 @@ Common options:
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `--amerge-id` | (required) | Account identifier |
-| `--mode` | `threshold` | `threshold` or `anomaly` |
+| `--mode` | `threshold` | `threshold`, `anomaly`, or `uniformity` |
 | `--time-frame` | `T-7` | Detection window as `T-N` days back |
-| `--rank-type` | `both` | `1` (subcategory), `2` (main), or `both` |
+| `--rank-type` | `both` | `1` (subcategory), `2` (main), or `both` (ignored in uniformity) |
 | `--marketplace` | (none) | Optional two-letter marketplace filter |
-| `--output` | auto | CSV path (default `rank_{drops,anomalies}_<id>_T-<N>_<date>.csv`) |
+| `--output` | auto | CSV path (default `rank_{drops,anomalies,uniformity}_<id>_T-<N>_<date>.csv`) |
 | `--no-table` | off | Suppress the stdout preview table |
 
 `threshold`-mode options: `--min-pct` (100), `--min-positions` (100).
 
 `anomaly`-mode options: `--baseline-days` (45), `--z-threshold` (3.5),
 `--min-sustain` (2), `--min-floor-pct` (20).
+
+`uniformity`-mode options: `--min-children` (3), `--uniform-ratio` (1.5),
+`--divergence-ratio` (3.0), `--child-deviation-factor` (2.0),
+`--anomalous-fraction` (0.667; pass `0.5` for ">half", ~`0.9` for "all-but-few").
+Uses `--baseline-days` for the trailing uniformity baseline.
 
 **Cohort de-noising** (opt-in, anomaly mode): add `--cohort-denoise` to subtract
 each `(rank_type, category)` cohort's median daily move before scoring, so

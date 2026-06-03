@@ -12,6 +12,7 @@ from rank_drop_checker import (
     Observation,
     compute_cohort_moves,
     detect_anomalous_drop,
+    detect_uniformity_break,
     largest_qualifying_move,
     parse_time_frame,
 )
@@ -193,6 +194,150 @@ def test_anomaly_improvement_not_flagged():
     stable = [(d, 500 + (d % 3)) for d in range(1, 15)]
     improve = [(25, 500), (26, 50), (27, 48)]  # rank got much better
     assert _detect_anomaly(_series(stable + improve)) is None
+
+
+# --- uniformity mode -------------------------------------------------------
+
+UNI_WINDOW_START = date(2026, 5, 25)
+
+
+def _uni_series(uniform_days, window_days):
+    """Build {date: {asin: rank}}. uniform_days: list of (day, rank) applied to
+    all of x,y,z,w. window_days: list of (day, {asin: rank})."""
+    per_date: dict = {}
+    for day, rank in uniform_days:
+        per_date[date(2026, 5, day)] = {a: rank for a in ("x", "y", "z", "w")}
+    for day, ranks in window_days:
+        per_date[date(2026, 5, day)] = dict(ranks)
+    return per_date
+
+
+def _detect_uni(per_date, **kwargs):
+    return detect_uniformity_break(
+        "AP",
+        "Tools & Home Improvement",
+        per_date,
+        UNI_WINDOW_START,
+        rank_type=kwargs.get("rank_type", 2),
+        min_children=kwargs.get("min_children", 3),
+        uniform_ratio=kwargs.get("uniform_ratio", 1.5),
+        divergence_ratio=kwargs.get("divergence_ratio", 3.0),
+        child_deviation_factor=kwargs.get("child_deviation_factor", 2.0),
+        anomalous_fraction=kwargs.get("anomalous_fraction", 2 / 3),
+        relative_divergence=kwargs.get("relative_divergence"),
+    )
+
+
+def test_uniformity_fanout_flags_anomalous():
+    # All four children at 12 for days 20..25, then fan out on day 26.
+    per_date = _uni_series(
+        [(d, 12) for d in range(20, 26)],
+        [(26, {"x": 31, "y": 25, "z": 102, "w": 155})],
+    )
+    event = _detect_uni(per_date, rank_type=1)
+    assert event is not None
+    assert event.severity == "anomalous"
+    assert event.event_date == date(2026, 5, 26)
+    assert event.n_children == 4
+    assert event.n_diverged == 4  # all >= 2x of prior level 12
+    assert event.prior_uniform_rank == 12
+    assert event.rank_type == 1  # carries the rank type it was scanned in
+
+
+def test_uniformity_single_outlier_is_suspect():
+    # Only w jumps; x,y,z stay uniform -> minority -> suspect.
+    per_date = _uni_series(
+        [(d, 12) for d in range(20, 26)],
+        [(26, {"x": 12, "y": 13, "z": 12, "w": 155})],
+    )
+    event = _detect_uni(per_date)
+    assert event is not None
+    assert event.severity == "suspect"
+    assert event.n_diverged == 1
+
+
+def test_uniformity_anomalous_fraction_boundary():
+    # Two of four diverge = 0.5. Default 2/3 -> suspect; pass 0.5 -> anomalous.
+    window = [(26, {"x": 12, "y": 13, "z": 80, "w": 100})]
+    per_date = _uni_series([(d, 12) for d in range(20, 26)], window)
+    assert _detect_uni(per_date).severity == "suspect"
+    assert _detect_uni(per_date, anomalous_fraction=0.5).severity == "anomalous"
+
+
+def test_uniformity_always_dispersed_parent_not_flagged():
+    # Children are never uniform (spread > uniform_ratio in baseline) -> None.
+    per_date = {
+        date(2026, 5, d): {"x": 10, "y": 50, "z": 200, "w": 600} for d in range(20, 27)
+    }
+    assert _detect_uni(per_date) is None
+
+
+def test_uniformity_improvement_only_not_flagged():
+    # Spread grows but because children improved (ranks dropped) -> no diverged.
+    per_date = _uni_series(
+        [(d, 100) for d in range(20, 26)],
+        [(26, {"x": 100, "y": 95, "z": 20, "w": 8})],
+    )
+    assert _detect_uni(per_date) is None
+
+
+def test_uniformity_too_few_children_not_flagged():
+    per_date = {date(2026, 5, d): {"x": 12, "y": 12} for d in range(20, 26)}
+    per_date[date(2026, 5, 26)] = {"x": 12, "y": 200}
+    assert _detect_uni(per_date, min_children=3) is None
+
+
+def test_uniformity_multiday_picks_strongest_and_lists_others():
+    # Diverge on day 26 (spread ~13x), recover, diverge again day 29 (spread ~5x).
+    per_date = _uni_series(
+        [(d, 12) for d in range(18, 26)],
+        [
+            (26, {"x": 31, "y": 25, "z": 102, "w": 155}),  # spread 155/25=6.2
+            (27, {"x": 12, "y": 12, "z": 12, "w": 12}),  # back to uniform
+            (28, {"x": 12, "y": 12, "z": 12, "w": 12}),
+            (29, {"x": 40, "y": 30, "z": 38, "w": 36}),  # spread 40/30=1.33 < 3 (no)
+            (30, {"x": 12, "y": 12, "z": 12, "w": 12}),
+            (31, {"x": 200, "y": 250, "z": 30, "w": 40}),  # spread 250/30=8.3 strongest
+        ],
+    )
+    event = _detect_uni(per_date)
+    assert event is not None
+    assert event.event_date == date(2026, 5, 31)  # strongest spread
+    assert date(2026, 5, 26) in event.other_event_dates
+    # Most recent occurrence across strongest + others.
+    assert event.last_event_date == date(2026, 5, 31)
+
+
+def test_uniformity_last_event_date_differs_from_strongest():
+    # Strongest fan-out on day 26, a smaller later one on day 30.
+    per_date = _uni_series(
+        [(d, 12) for d in range(18, 26)],
+        [
+            (26, {"x": 31, "y": 25, "z": 102, "w": 400}),  # spread 16x (strongest)
+            (27, {"x": 12, "y": 12, "z": 12, "w": 12}),
+            (28, {"x": 12, "y": 12, "z": 12, "w": 12}),
+            (29, {"x": 12, "y": 12, "z": 12, "w": 12}),
+            (30, {"x": 12, "y": 12, "z": 12, "w": 60}),  # spread 5x (later, weaker)
+        ],
+    )
+    event = _detect_uni(per_date)
+    assert event is not None
+    assert event.event_date == date(2026, 5, 26)  # strongest
+    assert event.last_event_date == date(2026, 5, 30)  # most recent
+
+
+def test_uniformity_relative_divergence_flags_tight_family():
+    # Family glued at 12 for days 18..25, then a modest 1.6x spread on day 26.
+    per_date = _uni_series(
+        [(d, 12) for d in range(18, 26)],
+        [(26, {"x": 12, "y": 12, "z": 12, "w": 19})],  # spread 19/12 = 1.58x
+    )
+    # Absolute bar (3.0) misses it.
+    assert _detect_uni(per_date, child_deviation_factor=1.5) is None
+    # Relative bar: 1.5 x the family's normal spread (~1.0) = 1.5 -> 1.58 trips it.
+    event = _detect_uni(per_date, relative_divergence=1.5, child_deviation_factor=1.5)
+    assert event is not None
+    assert event.severity == "suspect"  # only w diverged (1 of 4)
 
 
 @pytest.mark.parametrize(
