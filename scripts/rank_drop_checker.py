@@ -29,6 +29,9 @@ from statistics import median
 import psycopg
 from dotenv import load_dotenv
 
+# Directory for generated CSV exports.
+EXPORT_DIR = "export_output"
+
 # asin_ranks.type -> human label (from live-data inspection).
 RANK_TYPE_LABELS: dict[int, str] = {1: "subcategory", 2: "main"}
 
@@ -299,6 +302,38 @@ class UniformityEvent:
         return max([self.event_date, *self.other_event_dates])
 
 
+@dataclass(frozen=True)
+class CorankEvent:
+    """A co-rank pseudo-group (ASINs sharing a rank) that fanned out next day."""
+
+    pseudo_group_id: str  # synthetic label, e.g. "B07...@14"
+    rank_type: int  # 1 = subcategory, 2 = main
+    category: str
+    severity: str  # "anomalous" | "suspect"
+    group_date: date  # day the ASINs shared a rank (D)
+    break_date: date  # day they fanned out (D+1)
+    prior_shared_rank: float  # the shared rank level at group_date
+    spread_ratio: float  # max/min of member ranks on the break day
+    members: list[ChildRank]
+    other_break_dates: list[date]
+
+    @property
+    def n_members(self) -> int:
+        return len(self.members)
+
+    @property
+    def n_diverged(self) -> int:
+        return sum(m.diverged for m in self.members)
+
+    @property
+    def diverged_fraction(self) -> float:
+        return self.n_diverged / self.n_members if self.members else 0.0
+
+    @property
+    def last_break_date(self) -> date:
+        return max([self.break_date, *self.other_break_dates])
+
+
 def _spread_ratio(ranks: list[int]) -> float:
     """max/min of a group's ranks (1.0 == perfectly uniform)."""
     lo = min(ranks)
@@ -417,6 +452,130 @@ def detect_uniformity_break(
         children=strongest.children,
         other_event_dates=others,
     )
+
+
+def _build_corank_groups(
+    ranks: dict[str, int], uniform_ratio: float, min_size: int
+) -> list[list[str]]:
+    """Cluster ASINs that share a rank into co-rank pseudo-groups.
+
+    Pure helper. ASINs are sorted by rank and greedily clustered: an ASIN joins
+    the current cluster while its rank stays within ``uniform_ratio`` of the
+    cluster's smallest (best) rank, so every cluster keeps ``max/min <=
+    uniform_ratio``. Returns clusters with at least ``min_size`` members. Because
+    Amazon assigns the same BSR to a parent's child variations, a tight co-rank
+    cluster within one category is effectively one variation family — no
+    registry ``parent_asin`` needed.
+    """
+    ordered = sorted(ranks.items(), key=lambda kv: kv[1])
+    groups: list[list[str]] = []
+    current: list[str] = []
+    cluster_min = 0
+    for asin, rank in ordered:
+        if current and cluster_min > 0 and rank / cluster_min <= uniform_ratio:
+            current.append(asin)
+        else:
+            if len(current) >= min_size:
+                groups.append(current)
+            current = [asin]
+            cluster_min = rank
+    if len(current) >= min_size:
+        groups.append(current)
+    return groups
+
+
+def detect_corank_breaks(
+    category: str,
+    per_date_ranks: dict[date, dict[str, int]],
+    window_start: date,
+    *,
+    rank_type: int,
+    min_group_size: int,
+    uniform_ratio: float,
+    divergence_ratio: float,
+    child_deviation_factor: float,
+    anomalous_fraction: float,
+) -> list[CorankEvent]:
+    """Flag co-rank pseudo-groups whose uniformity breaks the very next day.
+
+    Pure function (no DB). ``per_date_ranks`` maps a date to ``{asin: rank}`` for
+    one (category, rank_type). Baseline-free: for each consecutive day pair
+    ``(D, D+1)`` whose later day falls in the window, build pseudo-groups from the
+    ASINs that *share a rank* at ``D`` (``_build_corank_groups``), then look at the
+    same ASINs at ``D+1``. A group breaks when its ``D+1`` ranks fan out to
+    ``max/min >= divergence_ratio``. A member *diverged* if its ``D+1`` rank is
+    ``>= child_deviation_factor`` times the shared level ``L`` (median rank at
+    ``D``) — worsening only; if none diverged (spread came from improvement), the
+    group is skipped. ``>= anomalous_fraction`` of members diverging makes it
+    *anomalous*, else *suspect*. Each pseudo-group (identified by its member set)
+    keeps its strongest break; other break dates go to ``other_break_dates``.
+    """
+    dated = sorted(per_date_ranks.items())
+    by_group: dict[frozenset[str], list[CorankEvent]] = {}
+    for idx in range(1, len(dated)):
+        day, ranks_next = dated[idx]
+        if day < window_start:
+            continue
+        prev_day, ranks_prev = dated[idx - 1]
+        for group in _build_corank_groups(ranks_prev, uniform_ratio, min_group_size):
+            present = {a: ranks_next[a] for a in group if a in ranks_next}
+            if len(present) < 2:
+                continue
+            spread = _spread_ratio(list(present.values()))
+            if spread < divergence_ratio:
+                continue
+            level = float(median([ranks_prev[a] for a in group]))
+            members = [
+                ChildRank(
+                    asin=asin,
+                    rank=rank,
+                    deviation_x=rank / level if level > 0 else float("inf"),
+                    diverged=rank >= child_deviation_factor * level,
+                )
+                for asin, rank in sorted(present.items())
+            ]
+            n_diverged = sum(m.diverged for m in members)
+            if n_diverged == 0:  # fanned out only by improving — not a drop
+                continue
+            fraction = n_diverged / len(members)
+            severity = "anomalous" if fraction >= anomalous_fraction else "suspect"
+            group_id = f"{min(group)}@{round(level)}"
+            by_group.setdefault(frozenset(group), []).append(
+                CorankEvent(
+                    pseudo_group_id=group_id,
+                    rank_type=rank_type,
+                    category=category,
+                    severity=severity,
+                    group_date=prev_day,
+                    break_date=day,
+                    prior_shared_rank=level,
+                    spread_ratio=spread,
+                    members=members,
+                    other_break_dates=[],
+                )
+            )
+
+    events: list[CorankEvent] = []
+    for candidates in by_group.values():
+        strongest = max(candidates, key=lambda e: e.spread_ratio)
+        others = sorted(
+            e.break_date for e in candidates if e.break_date != strongest.break_date
+        )
+        events.append(
+            CorankEvent(
+                pseudo_group_id=strongest.pseudo_group_id,
+                rank_type=strongest.rank_type,
+                category=strongest.category,
+                severity=strongest.severity,
+                group_date=strongest.group_date,
+                break_date=strongest.break_date,
+                prior_shared_rank=strongest.prior_shared_rank,
+                spread_ratio=strongest.spread_ratio,
+                members=strongest.members,
+                other_break_dates=others,
+            )
+        )
+    return events
 
 
 def fetch_account_asins(
@@ -754,6 +913,85 @@ def find_uniformity_breaks(
     return events, summary
 
 
+# Calendar lead-in so the first in-window day still has a prior observation to
+# pair with (covers weekend/missing-day gaps in the daily series).
+CORANK_LEAD_IN_DAYS = 3
+
+
+def find_corank_breaks(
+    registry_conn: psycopg.Connection,
+    roas_conn: psycopg.Connection,
+    *,
+    amerge_id: str,
+    days: int,
+    min_group_size: int,
+    uniform_ratio: float,
+    divergence_ratio: float,
+    child_deviation_factor: float,
+    anomalous_fraction: float,
+    marketplace: str | None,
+    rank_type: str = "2",
+) -> tuple[list[CorankEvent], dict[str, object]]:
+    """Co-rank pipeline: flag pseudo-groups (shared-rank ASINs) that fan out.
+
+    Unlike ``uniformity`` this needs no registry ``parent_asin`` and no baseline:
+    families are reconstructed each day from ASINs that share a rank within a
+    category. ``rank_type`` "2" main, "1" subcategory, or "both" (each type is its
+    own grouping space).
+    """
+    asins = fetch_account_asins(registry_conn, amerge_id, marketplace)
+    summary: dict[str, object] = {
+        "amerge_id": amerge_id,
+        "asin_count": len(asins),
+        "categories_scanned": 0,
+    }
+    if not asins:
+        return [], summary
+
+    cur_date = fetch_latest_report_date(roas_conn)
+    if cur_date is None:
+        return [], summary
+    window_start = cur_date - timedelta(days=days)
+    fetch_start = window_start - timedelta(days=CORANK_LEAD_IN_DAYS)
+    summary["window_start"] = window_start
+    summary["window_end"] = cur_date
+
+    series, categories = fetch_series(
+        roas_conn, asins, fetch_start, cur_date, rank_type=rank_type
+    )
+
+    # Group into (rank_type, cat_hash) -> {date -> {asin -> rank}}. Grouping is by
+    # category, NOT parent; co-rank clustering separates families within it.
+    groups: dict[tuple[int, str], dict[date, dict[str, int]]] = {}
+    cat_title: dict[tuple[int, str], str] = {}
+    for key, observations in series.items():
+        asin, rtype, cat_hash = key
+        group_key = (rtype, cat_hash)
+        by_date = groups.setdefault(group_key, {})
+        cat_title[group_key] = categories[key]
+        for obs in observations:
+            by_date.setdefault(obs.report_date, {})[asin] = obs.rank
+    summary["categories_scanned"] = len(groups)
+
+    events: list[CorankEvent] = []
+    for (rtype, _cat_hash), per_date in groups.items():
+        events.extend(
+            detect_corank_breaks(
+                cat_title[(rtype, _cat_hash)],
+                per_date,
+                window_start,
+                rank_type=rtype,
+                min_group_size=min_group_size,
+                uniform_ratio=uniform_ratio,
+                divergence_ratio=divergence_ratio,
+                child_deviation_factor=child_deviation_factor,
+                anomalous_fraction=anomalous_fraction,
+            )
+        )
+    events.sort(key=lambda e: (_SEVERITY_ORDER.get(e.severity, 9), -e.spread_ratio))
+    return events, summary
+
+
 def _type_label(rank_type: int) -> str:
     return RANK_TYPE_LABELS.get(rank_type, str(rank_type))
 
@@ -797,8 +1035,16 @@ CSV_HEADER = [
 ]
 
 
+def _ensure_parent_dir(path: str) -> None:
+    """Create the directory holding ``path`` if it does not yet exist."""
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
 def write_csv(moves: list[Move], path: str) -> None:
     """Write findings to ``path`` as CSV (one row per ASIN/category move)."""
+    _ensure_parent_dir(path)
     with open(path, "w", newline="") as fh:
         writer = csv.writer(fh)
         writer.writerow(CSV_HEADER)
@@ -854,6 +1100,7 @@ ANOMALY_CSV_HEADER = [
 
 def write_anomaly_csv(findings: list[AnomalyFinding], path: str) -> None:
     """Write anomaly findings to ``path`` as CSV (one row per ASIN/category)."""
+    _ensure_parent_dir(path)
     with open(path, "w", newline="") as fh:
         writer = csv.writer(fh)
         writer.writerow(ANOMALY_CSV_HEADER)
@@ -915,6 +1162,7 @@ UNIFORMITY_CSV_HEADER = [
 
 def write_uniformity_csv(events: list[UniformityEvent], path: str) -> None:
     """Write uniformity findings to ``path`` — one row per child of each parent."""
+    _ensure_parent_dir(path)
     with open(path, "w", newline="") as fh:
         writer = csv.writer(fh)
         writer.writerow(UNIFORMITY_CSV_HEADER)
@@ -943,6 +1191,78 @@ def write_uniformity_csv(events: list[UniformityEvent], path: str) -> None:
                 )
 
 
+def render_corank_table(events: list[CorankEvent]) -> str:
+    """Aligned text table: one line per flagged co-rank pseudo-group."""
+    header = (
+        f"{'PSEUDO-GROUP':<16} {'TYPE':<12} {'SEVERITY':<10} {'CATEGORY':<22} "
+        f"{'GROUP→BREAK':<23} {'MEMB':>5} {'DIV':>4} {'FRAC':>5} "
+        f"{'SHARED':>8} {'SPREAD×':>8}  {'OTHER BREAKS':<24}"
+    )
+    lines = [header, "-" * len(header)]
+    for e in events:
+        others = ",".join(d.isoformat() for d in e.other_break_dates) or "-"
+        window = f"{e.group_date.isoformat()}→{e.break_date.isoformat()}"
+        lines.append(
+            f"{e.pseudo_group_id:<16} {_type_label(e.rank_type):<12} {e.severity:<10} "
+            f"{_truncate(e.category, 22):<22} {window:<23} "
+            f"{e.n_members:>5} {e.n_diverged:>4} {e.diverged_fraction:>5.0%} "
+            f"{round(e.prior_shared_rank):>8} {e.spread_ratio:>7.1f}x  "
+            f"{_truncate(others, 24):<24}"
+        )
+    return "\n".join(lines)
+
+
+CORANK_CSV_HEADER = [
+    "pseudo_group_id",
+    "rank_type",
+    "rank_type_label",
+    "asin",
+    "category",
+    "group_date",
+    "break_date",
+    "severity",
+    "n_members",
+    "n_diverged",
+    "diverged_fraction",
+    "prior_shared_rank",
+    "member_rank",
+    "member_deviation_x",
+    "member_diverged",
+    "other_break_dates",
+]
+
+
+def write_corank_csv(events: list[CorankEvent], path: str) -> None:
+    """Write co-rank findings to ``path`` — one row per member of each group."""
+    _ensure_parent_dir(path)
+    with open(path, "w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(CORANK_CSV_HEADER)
+        for e in events:
+            others = ",".join(d.isoformat() for d in e.other_break_dates)
+            for m in e.members:
+                writer.writerow(
+                    [
+                        e.pseudo_group_id,
+                        e.rank_type,
+                        _type_label(e.rank_type),
+                        m.asin,
+                        e.category,
+                        e.group_date.isoformat(),
+                        e.break_date.isoformat(),
+                        e.severity,
+                        e.n_members,
+                        e.n_diverged,
+                        f"{e.diverged_fraction:.3f}",
+                        round(e.prior_shared_rank),
+                        m.rank,
+                        f"{m.deviation_x:.2f}",
+                        int(m.diverged),
+                        others,
+                    ]
+                )
+
+
 def default_output_path(
     amerge_id: str, end_date: date | None, mode: str, days: int
 ) -> str:
@@ -952,8 +1272,10 @@ def default_output_path(
     stem = {
         "anomaly": "rank_anomalies",
         "uniformity": "rank_uniformity",
+        "corank": "rank_corank",
     }.get(mode, "rank_drops")
-    return f"{stem}_{safe_id}_T-{days}_{suffix}.csv"
+    filename = f"{stem}_{safe_id}_T-{days}_{suffix}.csv"
+    return os.path.join(EXPORT_DIR, filename)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -963,11 +1285,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--amerge-id", required=True, help="Account amerge_id")
     parser.add_argument(
         "--mode",
-        choices=("threshold", "anomaly", "uniformity"),
+        choices=("threshold", "anomaly", "uniformity", "corank"),
         default="threshold",
         help="Detection mode: 'threshold' (fixed %%/positions, default), "
-        "'anomaly' (drops unusual vs each product's own history), or "
-        "'uniformity' (a parent's child ASINs suddenly fan out in main rank).",
+        "'anomaly' (drops unusual vs each product's own history), "
+        "'uniformity' (a parent's child ASINs suddenly fan out in main rank), or "
+        "'corank' (data-driven pseudo-groups of shared-rank ASINs that fan out "
+        "next day; no registry parent, no baseline).",
     )
     parser.add_argument(
         "--time-frame",
@@ -1031,8 +1355,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--min-children",
         type=int,
         default=DEFAULT_MIN_CHILDREN,
-        help=f"[uniformity] Min child ASINs a parent needs to test "
-        f"(default {DEFAULT_MIN_CHILDREN}).",
+        help=f"[uniformity/corank] Min ASINs a parent (or co-rank pseudo-group) "
+        f"needs to test (default {DEFAULT_MIN_CHILDREN}).",
     )
     parser.add_argument(
         "--uniform-ratio",
@@ -1115,6 +1439,8 @@ def main(argv: list[str] | None = None) -> int:
     ):
         if args.mode == "uniformity":
             return _run_uniformity(registry_conn, roas_conn, args)
+        if args.mode == "corank":
+            return _run_corank(registry_conn, roas_conn, args)
         if args.mode == "anomaly":
             findings, summary = find_rank_anomalies(
                 registry_conn,
@@ -1211,6 +1537,51 @@ def _run_uniformity(
         f"\n# {len(events)} parent(s) flagged ({n_anom} anomalous, {n_susp} suspect) "
         f"out of {summary['parents_scanned']} scanned "
         f"({summary['child_asin_count']} child ASINs) | mode uniformity | "
+        f"window {summary.get('window_start')} -> {summary.get('window_end')} | "
+        f"CSV: {output_path}",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def _run_corank(
+    registry_conn: psycopg.Connection,
+    roas_conn: psycopg.Connection,
+    args: argparse.Namespace,
+) -> int:
+    """Run co-rank mode end to end (own output + summary shape)."""
+    events, summary = find_corank_breaks(
+        registry_conn,
+        roas_conn,
+        amerge_id=args.amerge_id,
+        days=args.time_frame,
+        min_group_size=args.min_children,
+        uniform_ratio=args.uniform_ratio,
+        divergence_ratio=args.divergence_ratio,
+        child_deviation_factor=args.child_deviation_factor,
+        anomalous_fraction=args.anomalous_fraction,
+        marketplace=args.marketplace,
+        rank_type=args.rank_type,
+    )
+
+    output_path = args.output or default_output_path(
+        args.amerge_id, summary.get("window_end"), args.mode, args.time_frame
+    )
+    write_corank_csv(events, output_path)
+
+    if not args.no_table:
+        print(
+            render_corank_table(events)
+            if events
+            else "No co-rank pseudo-groups met the break conditions."
+        )
+
+    n_anom = sum(e.severity == "anomalous" for e in events)
+    n_susp = sum(e.severity == "suspect" for e in events)
+    print(
+        f"\n# {len(events)} pseudo-group(s) flagged ({n_anom} anomalous, "
+        f"{n_susp} suspect) out of {summary['categories_scanned']} co-rank "
+        f"categories scanned ({summary['asin_count']} ASINs) | mode corank | "
         f"window {summary.get('window_start')} -> {summary.get('window_end')} | "
         f"CSV: {output_path}",
         file=sys.stderr,
