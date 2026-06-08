@@ -4,9 +4,6 @@
 
 # Generated exports
 export_output/
-rank_drops_*.csv
-rank_anomalies_*.csv
-rank_uniformity_*.csv
 rank_corank_*.csv
 
 # Python
